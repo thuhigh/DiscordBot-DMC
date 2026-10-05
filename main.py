@@ -3,6 +3,7 @@ File chạy chính của bot Discord.
 Xem README.md để biết cách setup Discord Bot + Firebase + deploy Render.
 """
 
+import io
 import os
 import time
 import asyncio
@@ -12,6 +13,7 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import aiohttp
+from PIL import Image
 
 import emoji_mixer
 import firebase
@@ -26,6 +28,7 @@ GUILD_ID = os.getenv("GUILD_ID") or None
 
 TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME", "tahnuyo_0")
 TIKTOK_CHECK_INTERVAL_SECONDS = 5 * 60 * 60  # cứ 5 tiếng check 1 lần
+TIKTOK_ANNOUNCE_CHANNEL_ID = int(os.getenv("TIKTOK_ANNOUNCE_CHANNEL_ID") or 0) or None  # tuỳ chọn: kênh báo khi đổi tên
 BOT_NAME_SUFFIX = " Bot"  # tên bot = "<Nickname TikTok> Bot", vd "Delta Mick Bot"
 
 # Kênh thông báo lên level khi XP đến từ voice chat (không nhắn tin nên không
@@ -161,12 +164,37 @@ async def before_voice_xp_task():
     await bot.wait_until_ready()
 
 
-# ==================== ĐỒNG BỘ TÊN BOT THEO TIKTOK ====================
+# ==================== ĐỒNG BỘ TÊN + AVATAR BOT / TÊN + ICON SERVER THEO TIKTOK ====================
+def _normalize_image(raw: bytes) -> bytes:
+    """Chuyển ảnh TikTok (jpeg/webp/heic...) về PNG vuông, tối đa 512x512 để Discord chấp nhận chắc chắn."""
+    img = Image.open(io.BytesIO(raw)).convert("RGBA")
+    side = min(img.size)
+    left, top = (img.width - side) // 2, (img.height - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    if side > 512:
+        img = img.resize((512, 512), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _target_guilds() -> list[discord.Guild]:
+    """Server cần đồng bộ: GUILD_ID nếu có cấu hình, không thì tất cả server bot đang ở."""
+    if GUILD_ID:
+        guild = bot.get_guild(int(GUILD_ID))
+        return [guild] if guild else []
+    return list(bot.guilds)
+
+
 async def sync_tiktok_name(force: bool = False) -> dict:
     """
     Kiểm tra tên/avatar TikTok của TIKTOK_USERNAME. Nếu có thay đổi so với
-    lần trước (hoặc force=True), đổi tên bot thành "<Nickname TikTok> Bot"
-    và đổi avatar bot theo TikTok. Không đụng tới tên/icon của server.
+    lần trước (hoặc force=True) thì:
+      - đổi tên bot thành "<Nickname TikTok> Bot" + đổi avatar bot
+      - đổi tên server thành "<Nickname TikTok>" + đổi icon server
+    Mỗi phần chạy độc lập: phần nào lỗi (vd bị rate-limit đổi tên bot) thì không
+    chặn các phần còn lại, và trạng thái chỉ được lưu khi mọi thứ thành công
+    để lần check sau tự thử lại.
     """
     profile = await tiktok.fetch_tiktok_profile(TIKTOK_USERNAME)
     if not profile:
@@ -175,6 +203,7 @@ async def sync_tiktok_name(force: bool = False) -> dict:
     nickname = profile["nickname"]
     avatar_url = profile["avatar_url"]
     bot_name = (nickname + BOT_NAME_SUFFIX)[:32]
+    guild_name = nickname[:100]
 
     try:
         state = await firebase.get_tiktok_sync_state()
@@ -185,36 +214,82 @@ async def sync_tiktok_name(force: bool = False) -> dict:
         return {"ok": True, "changed": False}
 
     async with aiohttp.ClientSession() as session:
-        avatar_bytes = await tiktok.download_bytes(session, avatar_url)
+        raw_avatar = await tiktok.download_bytes(session, avatar_url)
 
-    if not avatar_bytes:
+    if not raw_avatar:
         return {"ok": False, "reason": "Không tải được ảnh đại diện TikTok."}
 
+    try:
+        avatar_bytes = await asyncio.to_thread(_normalize_image, raw_avatar)
+    except Exception:
+        log.exception("Không xử lý được ảnh avatar TikTok")
+        return {"ok": False, "reason": "Ảnh đại diện TikTok không đọc được."}
+
     errors: list[str] = []
+
+    # --- Bot ---
     try:
         await bot.user.edit(username=bot_name, avatar=avatar_bytes)
     except discord.HTTPException as e:
         errors.append(f"đổi tên/avatar bot: {e}")
 
-    try:
-        await firebase.save_tiktok_sync_state({
-            "nickname": nickname,
-            "avatar_url": avatar_url,
-            "updated_at": time.time(),
-        })
-    except firebase.FirebaseUnavailable:
-        errors.append("lưu trạng thái đồng bộ vào Firebase thất bại")
+    # --- Server(s) ---
+    guilds_done: list[str] = []
+    for guild in _target_guilds():
+        try:
+            await guild.edit(name=guild_name, icon=avatar_bytes, reason=f"Đồng bộ theo TikTok @{TIKTOK_USERNAME}")
+            guilds_done.append(guild.name)
+        except discord.Forbidden:
+            errors.append(f"bot thiếu quyền Manage Server ở '{guild.name}'")
+        except discord.HTTPException as e:
+            errors.append(f"đổi tên/icon server '{guild.name}': {e}")
 
-    return {"ok": True, "changed": True, "bot_name": bot_name, "errors": errors}
+    if not errors:
+        try:
+            await firebase.save_tiktok_sync_state({
+                "nickname": nickname,
+                "avatar_url": avatar_url,
+                "updated_at": time.time(),
+            })
+        except firebase.FirebaseUnavailable:
+            errors.append("lưu trạng thái đồng bộ vào Firebase thất bại")
+
+    # --- Thông báo (tuỳ chọn): đặt TIKTOK_ANNOUNCE_CHANNEL_ID trong .env ---
+    if TIKTOK_ANNOUNCE_CHANNEL_ID and guilds_done:
+        channel = bot.get_channel(TIKTOK_ANNOUNCE_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="🎵 Đã đồng bộ theo TikTok",
+                description=f"Tên mới: **{nickname}**\nTheo dõi: https://www.tiktok.com/@{TIKTOK_USERNAME}",
+                color=discord.Color.from_rgb(254, 44, 85),
+            )
+            embed.set_thumbnail(url=avatar_url)
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+    # --- Cập nhật status của bot theo nickname mới ---
+    try:
+        await bot.change_presence(
+            activity=discord.Activity(type=discord.ActivityType.watching, name=f"TikTok {nickname}")
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "changed": True, "bot_name": bot_name, "guild_name": guild_name, "errors": errors}
 
 
 @tasks.loop(seconds=TIKTOK_CHECK_INTERVAL_SECONDS)
 async def tiktok_sync_task():
     result = await sync_tiktok_name()
     if not result.get("ok"):
-        log.warning(f"Đồng bộ tên bot theo TikTok thất bại: {result.get('reason')}")
+        log.warning(f"Đồng bộ TikTok thất bại: {result.get('reason')}")
     elif result.get("changed"):
-        log.info(f"Đã đổi tên bot theo TikTok @{TIKTOK_USERNAME}: {result.get('bot_name')}")
+        log.info(
+            f"Đã đồng bộ theo TikTok @{TIKTOK_USERNAME}: bot='{result.get('bot_name')}', "
+            f"server='{result.get('guild_name')}'"
+        )
         if result.get("errors"):
             log.warning(f"Có lỗi khi đồng bộ TikTok: {result['errors']}")
 
